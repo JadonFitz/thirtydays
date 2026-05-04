@@ -140,7 +140,10 @@ def parallel_search(
     data = http.request(
         "POST", "https://api.parallel.ai/v1/search",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json_data={"query": query, "max_results": count},
+        json_data={
+            "search_queries": [query],
+            "advanced_settings": {"max_results": count},
+        },
         timeout=15,
     )
     items = []
@@ -150,7 +153,7 @@ def parallel_search(
         url = r.get("url", "")
         if not url:
             continue
-        raw_date = r.get("published_date") or ""
+        raw_date = r.get("publish_date") or ""
         pub_date = _normalize_date(raw_date[:10]) if raw_date else None
         if not _in_date_range(pub_date, date_range):
             continue
@@ -159,7 +162,7 @@ def parallel_search(
             "title": r.get("title", ""),
             "url": url,
             "source_domain": _domain(url),
-            "snippet": r.get("snippet", ""),
+            "snippet": (r.get("excerpts") or [""])[0],
             "date": pub_date,
             "relevance": 0.8,
             "why_relevant": "Parallel AI web search",
