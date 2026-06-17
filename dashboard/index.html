@@ -586,9 +586,13 @@ function renderChat() {
         oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
       <button class="chat-send" id="chat-send" onclick="sendChat()">↑</button>
     </div>
+    <div style="text-align:right;padding-top:6px">
+      <span id="usage-badge" style="font-size:11px"></span>
+    </div>
   </div>`;
 
   scrollChat();
+  updateUsageBadge();
 }
 
 function renderMsg(m) {
@@ -615,6 +619,11 @@ async function sendChat() {
   const apiKey = localStorage.getItem("anthropic_key")||"";
   if (!apiKey) { openSettings(); return; }
 
+  if (usageRemaining() <= 0) {
+    toast("Daily limit of " + DAILY_LIMIT + " messages reached — resets tomorrow");
+    return;
+  }
+
   inp.value = "";
   inp.style.height = "auto";
   chatHistory.push({role:"user", content:msg});
@@ -630,6 +639,9 @@ async function sendChat() {
      </div>`);
   scrollChat();
   document.getElementById("chat-send").disabled = true;
+
+  bumpUsage();
+  updateUsageBadge();
 
   const system = buildSystemPrompt();
   try {
@@ -655,18 +667,36 @@ async function sendChat() {
   scrollChat();
 }
 
+// ── DAILY USAGE CAP ──────────────────────────────────────────────────────────
+const DAILY_LIMIT = 20;
+
+function usageKey() { return "chat_usage_" + new Date().toISOString().slice(0,10); }
+function usageToday() { return parseInt(localStorage.getItem(usageKey())||"0", 10); }
+function bumpUsage() {
+  const k = usageKey();
+  localStorage.setItem(k, (parseInt(localStorage.getItem(k)||"0",10)+1).toString());
+}
+function usageRemaining() { return Math.max(0, DAILY_LIMIT - usageToday()); }
+
+function updateUsageBadge() {
+  const el = document.getElementById("usage-badge");
+  if (!el) return;
+  const rem = usageRemaining();
+  el.textContent = rem + " msgs left today";
+  el.style.color = rem <= 5 ? "var(--red)" : rem <= 10 ? "var(--orange)" : "var(--t3)";
+}
+
 function buildSystemPrompt() {
   const files = data?.files || [];
   const today = new Date().toISOString().split("T")[0];
-  const researchDump = files.slice(0, 20).map(f =>
-    `### ${f.display_name} (${f.date||"undated"})\n${(f.content||"").slice(0, 2000)}`
+  // Send only the 4 most recent files, truncated — keeps context under ~1.5k tokens
+  const researchDump = files.slice(0, 4).map(f =>
+    `### ${f.display_name} (${f.date||"undated"})\n${(f.content||"").slice(0, 800)}`
   ).join("\n\n---\n\n");
 
   return `You are a personal research analyst for Jadon Cal Fitzpatrick, founder of New Terrain Creative (LA video production agency) and active crypto trader.
 
-Today's date: ${today}
-
-You have access to his last30days research archive (${files.length} files). Answer questions about trends, sentiment, opportunities, and what to research next. Be direct, specific, and cite your sources by file name when relevant.
+Today: ${today}. Archive: ${files.length} files total (showing 4 most recent below). Be direct and concise.
 
 RESEARCH ARCHIVE:
 ${researchDump || "No research files yet."}`;

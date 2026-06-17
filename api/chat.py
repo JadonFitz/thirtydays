@@ -25,9 +25,18 @@ class handler(BaseHTTPRequestHandler):
         messages = body.get("messages", [])
         system = body.get("system", "You are a helpful research assistant.")
 
+        # Cost guardrails — enforced server-side so the client can't override them
+        MAX_HISTORY   = 6          # last 3 turns (user+assistant pairs)
+        MAX_SYS_CHARS = 6_000      # ~1.5k tokens of research context
+        MAX_TOKENS    = 512        # response cap
+
+        messages = messages[-MAX_HISTORY:]
+        if len(system) > MAX_SYS_CHARS:
+            system = system[:MAX_SYS_CHARS] + "\n\n[Research context truncated to stay within cost limits]"
+
         payload = json.dumps({
             "model": "claude-haiku-4-5-20251001",
-            "max_tokens": 1024,
+            "max_tokens": MAX_TOKENS,
             "system": system,
             "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
         }).encode()
