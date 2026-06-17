@@ -1,0 +1,6 @@
+{
+  "buildCommand": "python3 dashboard/build.py",
+  "outputDirectory": "dashboard/dist",
+  "framework": null,
+  "installCommand": ""
+}

@@ -1,0 +1,61 @@
+name: Auto Research
+
+on:
+  schedule:
+    # 1st and 15th of each month at 9:00 AM UTC
+    - cron: "0 9 1,15 * *"
+  workflow_dispatch:
+    inputs:
+      topics:
+        description: "Comma-separated topics to research (leave blank for defaults)"
+        required: false
+        default: ""
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    env:
+      SCRAPECREATORS_API_KEY: ${{ secrets.SCRAPECREATORS_API_KEY }}
+      BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      LAST30DAYS_MEMORY_DIR: ${{ github.workspace }}/research
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r skills/last30days/scripts/requirements.txt 2>/dev/null || true
+          pip install uv
+          uv sync --frozen 2>/dev/null || true
+
+      - name: Run crypto research
+        run: |
+          TOPICS="${{ github.event.inputs.topics }}"
+          if [ -z "$TOPICS" ]; then
+            TOPICS="BTC market sentiment,ETH DeFi narrative,altcoin season signals,crypto macro 2026"
+          fi
+          IFS=',' read -ra TOPIC_ARR <<< "$TOPICS"
+          for topic in "${TOPIC_ARR[@]}"; do
+            topic=$(echo "$topic" | xargs)
+            echo "── Researching: $topic"
+            python3 skills/last30days/scripts/last30days.py "$topic" --emit=compact || true
+            sleep 5
+          done
+
+      - name: Commit and push research
+        run: |
+          git config user.name  "last30days-bot"
+          git config user.email "bot@last30days"
+          git add research/
+          if git diff --staged --quiet; then
+            echo "No new research files to commit."
+          else
+            git commit -m "research: auto-update $(date +%Y-%m-%d)"
+            git push
+          fi
