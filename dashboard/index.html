@@ -415,7 +415,7 @@ function renderTab(key) {
 
     <div class="sec-label">Recent Research (${files.length})</div>
     ${files.length
-      ? `<div class="research-list">${files.map((f,i)=>researchCard(f,i)).join("")}</div>`
+      ? `<div class="research-list">${files.map((f,i)=>researchCard(f,i,fileSentiment(f))).join("")}</div>`
       : `<div class="empty"><strong>No research yet</strong>Use a prompt below to start</div>`
     }
 
@@ -442,14 +442,21 @@ function renderTab(key) {
 const BULL_WORDS = ["bullish","rally","strong","momentum","surge","pump","breakout","support","accumulate","gains","positive","optimistic","moon","green","buy"];
 const BEAR_WORDS = ["bearish","dump","decline","sell","resistance","correction","crash","fud","fear","weak","drop","red","panic","concern"];
 
+function fileSentiment(f) {
+  const txt = (f.content||"").toLowerCase();
+  const b = BULL_WORDS.reduce((s,w)=>s+(txt.split(w).length-1),0);
+  const bd = BEAR_WORDS.reduce((s,w)=>s+(txt.split(w).length-1),0);
+  if (b > bd*1.2) return "bull";
+  if (bd > b*1.2) return "bear";
+  return "neu";
+}
+
 function sentimentScore(files) {
   let bull=0, bear=0, neu=0;
   files.forEach(f => {
-    const txt = (f.content||"").toLowerCase();
-    const b = BULL_WORDS.reduce((s,w)=>s+(txt.split(w).length-1),0);
-    const bd = BEAR_WORDS.reduce((s,w)=>s+(txt.split(w).length-1),0);
-    if (b > bd*1.2) bull++;
-    else if (bd > b*1.2) bear++;
+    const s = fileSentiment(f);
+    if (s==="bull") bull++;
+    else if (s==="bear") bear++;
     else neu++;
   });
   return {bull,bear,neu,total:files.length};
@@ -515,12 +522,22 @@ function svgDonut(bullPct, bearPct, color) {
 }
 
 // ── RESEARCH CARDS ────────────────────────────────────────────────────────────
-function researchCard(f, i) {
+const SENT_META = {
+  bull: { color:"var(--green)", label:"Bullish" },
+  bear: { color:"var(--red)",   label:"Bearish" },
+  neu:  { color:"var(--t3)",    label:"Neutral"  },
+};
+
+function researchCard(f, i, sent="neu") {
+  const {color, label} = SENT_META[sent];
   return `<div class="r-card" id="rc-${i}">
     <div class="r-header" onclick="toggleCard(${i})">
-      <div class="r-dot"></div>
+      <div class="r-dot" style="background:${color}"></div>
       <div class="r-info">
-        <div class="r-name">${escHtml(f.display_name)}</div>
+        <div class="r-name">${escHtml(f.display_name)}
+          <span style="font-size:10px;font-weight:600;padding:2px 6px;border-radius:4px;
+            background:${color}22;color:${color};margin-left:6px;vertical-align:middle">${label}</span>
+        </div>
         <div class="r-date">${f.date||"undated"} · ${f.filename}</div>
         <div class="r-preview">${escHtml(f.preview)}</div>
       </div>
