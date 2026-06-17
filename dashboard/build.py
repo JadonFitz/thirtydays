@@ -9,6 +9,24 @@ RESEARCH_DIR = ROOT / "research"
 DIST_DIR = Path(__file__).parent / "dist"
 
 CATEGORIES = {
+    "stocks": {
+        "name": "Stocks",
+        "color": "#fbbf24",
+        "description": "Public market research, individual stock analysis, investment theses",
+        "prompts": [
+            "/last30days CNTN Canton Strategic Holdings stock thesis",
+            "/last30days AI infrastructure cooling liquid cooling stocks 2026",
+            "/last30days optical interconnects data center stocks Coherent Lumentum",
+            "/last30days Modine Manufacturing MOD data center cooling",
+            "/last30days small cap AI infrastructure picks under $500M market cap",
+            "/last30days Canton Network DTCC tokenization October 2026",
+            "/last30days up and coming public companies strong fundamentals 2026",
+            "/last30days SanDisk flash storage AI training next play",
+        ],
+        "keywords": ["cntn", "canton-strategic", "microsoft", "msft",
+                     "stock-investment", "public-companies", "up-and-coming-public",
+                     "fidelity-investment", "cooling-stocks", "interconnect"],
+    },
     "crypto": {
         "name": "Crypto Trading",
         "color": "#00ff88",
