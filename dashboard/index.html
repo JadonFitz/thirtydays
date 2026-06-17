@@ -299,13 +299,14 @@ main{flex:1;padding:16px;max-width:600px;margin:0 auto;width:100%}
   <div class="modal">
     <h2>Settings</h2>
     <div class="field">
-      <label>Anthropic API Key</label>
-      <input type="password" id="sk-input" placeholder="sk-ant-…">
-      <div class="hint">Stored locally in your browser. Get one at console.anthropic.com</div>
+      <label>Daily Chat Limit</label>
+      <div style="font-size:13px;color:var(--t2);padding:4px 0">
+        <span id="modal-usage"></span>
+      </div>
+      <div class="hint">Resets at midnight. API key is managed server-side.</div>
     </div>
     <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="closeSettings()">Cancel</button>
-      <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+      <button class="btn btn-secondary" onclick="closeSettings()">Close</button>
     </div>
   </div>
 </div>
@@ -565,16 +566,7 @@ function toggleCard(i) {
 
 // ── CHAT ──────────────────────────────────────────────────────────────────────
 function renderChat() {
-  const apiKey = localStorage.getItem("anthropic_key")||"";
   const main = document.getElementById("main");
-  if (!apiKey) {
-    main.innerHTML = `<div class="no-key-msg">
-      <div>Add your Anthropic API key to enable the chat agent.</div>
-      <div style="font-size:11px;color:var(--t3);margin-top:6px">The key is stored only in your browser.</div>
-      <button onclick="openSettings()">Add API Key</button>
-    </div>`;
-    return;
-  }
 
   const msgsHtml = chatHistory.length ? chatHistory.map(renderMsg).join("") :
     `<div class="msg msg-ai">
@@ -619,9 +611,6 @@ async function sendChat() {
   const inp = document.getElementById("chat-in");
   const msg = inp?.value.trim();
   if (!msg) return;
-
-  const apiKey = localStorage.getItem("anthropic_key")||"";
-  if (!apiKey) { openSettings(); return; }
 
   if (usageRemaining() <= 0) {
     toast("Daily limit of " + DAILY_LIMIT + " messages reached — resets tomorrow");
@@ -708,21 +697,14 @@ ${researchDump || "No research files yet."}`;
 
 // ── SETTINGS ──────────────────────────────────────────────────────────────────
 function openSettings() {
-  const inp = document.getElementById("sk-input");
-  inp.value = localStorage.getItem("anthropic_key")||"";
+  const rem = usageRemaining();
+  document.getElementById("modal-usage").textContent =
+    rem + " of " + DAILY_LIMIT + " messages remaining today";
   document.getElementById("settings-modal").classList.add("open");
 }
 function closeSettings(e) {
   if (!e || e.target===document.getElementById("settings-modal"))
     document.getElementById("settings-modal").classList.remove("open");
-}
-function saveSettings() {
-  const val = document.getElementById("sk-input").value.trim();
-  if (val) localStorage.setItem("anthropic_key", val);
-  else localStorage.removeItem("anthropic_key");
-  document.getElementById("settings-modal").classList.remove("open");
-  toast("Settings saved");
-  if (activeCat==="chat") renderChat();
 }
 
 // ── UTILS ─────────────────────────────────────────────────────────────────────
