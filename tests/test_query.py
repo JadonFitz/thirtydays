@@ -2,7 +2,15 @@
 
 import unittest
 
-from lib.query import NOISE_WORDS, extract_compound_terms, extract_core_subject
+from lib.query import (
+    NOISE_WORDS,
+    PREFIXES,
+    SOCIAL_NOISE,
+    VIRAL_NOISE,
+    extract_compound_terms,
+    extract_core_subject,
+    infer_query_intent,
+)
 
 
 class TestExtractCoreSubject(unittest.TestCase):
@@ -28,15 +36,32 @@ class TestExtractCoreSubject(unittest.TestCase):
     def test_empty_string(self):
         self.assertEqual(extract_core_subject(""), "")
 
+    def test_second_person_use_prefixes_are_stripped(self):
+        self.assertEqual(extract_core_subject("how do you use Cursor"), "cursor")
+        self.assertEqual(extract_core_subject("how can I use Cursor"), "cursor")
+
+    def test_bare_how_do_you_and_how_can_i_are_stripped(self):
+        self.assertEqual(extract_core_subject("how can I debug docker"), "debug docker")
+        self.assertEqual(extract_core_subject("how do you deploy Next.js"), "deploy next.js")
+
+    def test_prefixes_are_ordered_longest_first(self):
+        """Prefix stripping stops after the first match, so a shorter prefix
+        listed before a longer one it leads would shadow it."""
+        for i, shorter in enumerate(PREFIXES):
+            for longer in PREFIXES[i + 1:]:
+                self.assertFalse(
+                    longer.startswith(shorter + " "),
+                    f"{shorter!r} is listed before {longer!r} and would shadow it",
+                )
+
     def test_all_noise_returns_original(self):
         # When all words are noise, fall back to original text
         result = extract_core_subject("best latest new")
         self.assertTrue(len(result) > 0)
 
     def test_only_first_prefix_stripped(self):
-        # "how to" should match, stripping once, not recursively
-        result = extract_core_subject("how to use how to debug")
-        self.assertIn("debug", result)
+        result = extract_core_subject("how to use how to debug", noise=frozenset())
+        self.assertEqual(result, "how to debug")
 
 
 class TestMaxWords(unittest.TestCase):
@@ -44,15 +69,21 @@ class TestMaxWords(unittest.TestCase):
 
     def test_max_words_caps_output(self):
         result = extract_core_subject(
-            "multi agent reinforcement learning framework",
+            "multi agent reinforcement learning framework distributed training",
             max_words=5,
         )
-        self.assertLessEqual(len(result.split()), 5)
+        self.assertEqual(result, "multi agent reinforcement learning framework")
 
     def test_max_words_none_no_cap(self):
         result = extract_core_subject("cursor IDE react native components")
-        # Without max_words, no cap applied
-        self.assertGreaterEqual(len(result.split()), 3)
+        self.assertEqual(result, "cursor ide react native components")
+
+    def test_max_words_strips_trailing_punctuation(self):
+        self.assertEqual(extract_core_subject("What is Claude Code?", max_words=5), "claude code")
+
+    def test_trailing_punctuation_does_not_hide_last_noise_word(self):
+        result = extract_core_subject("Claude Code best practices?", max_words=5, strip_suffixes=True)
+        self.assertEqual(result, "claude code")
 
     def test_max_words_fallback_on_empty(self):
         # All words filtered + max_words should fall back to original
@@ -67,21 +98,21 @@ class TestStripSuffixes(unittest.TestCase):
         result = extract_core_subject(
             "claude code best practices",
             strip_suffixes=True,
+            noise=frozenset(),
         )
-        self.assertNotIn("practices", result)
+        self.assertEqual(result, "claude code")
 
     def test_strips_use_cases(self):
         result = extract_core_subject(
             "react hooks use cases",
             strip_suffixes=True,
+            noise=frozenset(),
         )
-        self.assertNotIn("cases", result)
+        self.assertEqual(result, "react hooks")
 
     def test_no_strip_without_flag(self):
-        result = extract_core_subject("claude code best practices")
-        # "best" and "practices" are noise words so they get filtered anyway
-        # but the suffix phase doesn't run
-        self.assertIn("claude", result)
+        result = extract_core_subject("claude code best practices", noise=frozenset())
+        self.assertEqual(result, "claude code best practices")
 
 
 class TestCustomNoise(unittest.TestCase):
@@ -120,6 +151,103 @@ class TestNoiseWordsCompleteness(unittest.TestCase):
     def test_research_meta_present(self):
         for w in ('best', 'top', 'latest', 'trending', 'popular'):
             self.assertIn(w, NOISE_WORDS)
+
+
+
+class TestSharedAdapterNoiseSets(unittest.TestCase):
+    """Pin SOCIAL_NOISE / VIRAL_NOISE so adapters can rely on stable membership.
+
+    Bluesky, Threads, Truth Social use SOCIAL_NOISE.
+    TikTok, Instagram, Pinterest use VIRAL_NOISE.
+    YouTube extends VIRAL_NOISE with temporal/meta tokens (asserted in its
+    own adapter test).
+    """
+
+    def test_social_noise_membership(self):
+        # Words shared with the historical _BSKY_NOISE / _TS_NOISE / _THREADS_NOISE.
+        expected = {
+            'best', 'top', 'good', 'great', 'awesome',
+            'latest', 'new', 'news', 'update', 'updates',
+            'trending', 'hottest', 'popular', 'viral',
+            'practices', 'features', 'recommendations', 'advice',
+            'or', 'and',
+        }
+        self.assertEqual(set(SOCIAL_NOISE), expected)
+
+    def test_viral_noise_is_social_superset(self):
+        self.assertTrue(SOCIAL_NOISE.issubset(VIRAL_NOISE))
+        # The extra words VIRAL adds on top of SOCIAL: the historical
+        # tiktok / instagram / pinterest delta.
+        delta = VIRAL_NOISE - SOCIAL_NOISE
+        self.assertEqual(
+            delta,
+            {'killer', 'prompt', 'prompts', 'prompting',
+             'methods', 'strategies', 'approaches'},
+        )
+
+    def test_extract_core_subject_with_social_noise(self):
+        # Sanity: a Bluesky-style query strips through SOCIAL_NOISE.
+        result = extract_core_subject(
+            "best new Claude Code update",
+            noise=SOCIAL_NOISE,
+        )
+        self.assertEqual(result, "claude code")
+
+    def test_extract_core_subject_with_viral_noise(self):
+        # Viral set strips 'killer' and the prompt cluster.
+        result = extract_core_subject(
+            "killer prompting strategies for React",
+            noise=VIRAL_NOISE,
+        )
+        # 'for' is in the default NOISE_WORDS path but VIRAL_NOISE alone
+        # doesn't include articles/prepositions; extract_core_subject
+        # falls back to original when nothing survives, so allow 'for'.
+        self.assertIn("react", result)
+        self.assertNotIn("killer", result)
+        self.assertNotIn("prompting", result)
+
+
+class TestInferQueryIntent(unittest.TestCase):
+    """Tests for infer_query_intent() — the shared canonical classifier.
+
+    Adapters previously kept five near-duplicate copies with subtle drift
+    (reddit added `prediction` and the longest `how_to` regex; youtube had
+    a partial extension; instagram and tiktok lagged). Canonical here is
+    reddit's superset.
+    """
+
+    def test_comparison(self):
+        self.assertEqual(infer_query_intent("Claude vs Gemini"), "comparison")
+        self.assertEqual(infer_query_intent("difference between X and Y"), "comparison")
+
+    def test_how_to_base(self):
+        self.assertEqual(infer_query_intent("how to deploy Kubernetes"), "how_to")
+        self.assertEqual(infer_query_intent("install nginx"), "how_to")
+        self.assertEqual(infer_query_intent("setup OAuth tutorial"), "how_to")
+
+    def test_how_to_extended_keywords(self):
+        # Bare imperatives covered by reddit's extended regex.
+        self.assertEqual(infer_query_intent("configure DNS"), "how_to")
+        self.assertEqual(infer_query_intent("troubleshoot router"), "how_to")
+        self.assertEqual(infer_query_intent("debug python"), "how_to")
+        self.assertEqual(infer_query_intent("fix kernel panic"), "how_to")
+
+    def test_opinion(self):
+        self.assertEqual(infer_query_intent("thoughts on Claude Code"), "opinion")
+        self.assertEqual(infer_query_intent("should I buy a Pixel"), "opinion")
+
+    def test_product(self):
+        self.assertEqual(infer_query_intent("best laptop for programming"), "product")
+        self.assertEqual(infer_query_intent("Surface pricing"), "product")
+
+    def test_prediction(self):
+        self.assertEqual(infer_query_intent("predict the 2028 election"), "prediction")
+        self.assertEqual(infer_query_intent("odds Trump wins"), "prediction")
+        self.assertEqual(infer_query_intent("forecast Q4 earnings"), "prediction")
+
+    def test_breaking_news_default(self):
+        self.assertEqual(infer_query_intent("Kanye West"), "breaking_news")
+        self.assertEqual(infer_query_intent("OpenAI"), "breaking_news")
 
 
 class TestExtractCompoundTerms(unittest.TestCase):

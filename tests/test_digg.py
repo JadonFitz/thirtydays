@@ -206,6 +206,43 @@ def test_parse_post_drops_missing_body_or_handle_or_url():
     assert digg._parse_post({"author": {"username": "x"}, "body": "txt", "xUrl": ""}) is None
     assert digg._parse_post(None) is None  # type: ignore[arg-type]
 
+
+def test_parse_post_drops_non_http_scheme_xurl():
+    """Any non-http(s) scheme on xUrl yields no post.
+
+    A malicious Digg API response (or compromised upstream) could set xUrl to
+    javascript:, data:text/html;..., file:, vbscript:, etc. The HTML report
+    renders the xUrl into an <a href> attribute, so any non-web scheme is a
+    stored-XSS or local-file vector when the user clicks the attribution.
+    """
+    for bad_url in (
+        "javascript:alert(1)",
+        "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",
+        "vbscript:msgbox(1)",
+        "file:///etc/passwd",
+        "about:blank",
+    ):
+        out = digg._parse_post(_post(x_url=bad_url))
+        assert out is None, f"expected non-http xUrl to be dropped, got: {out}"
+
+    # http and https remain accepted.
+    assert digg._parse_post(_post(x_url="https://x.com/a/status/1")) is not None
+    assert digg._parse_post(_post(x_url="http://x.com/a/status/1")) is not None
+
+
+def test_parse_post_logs_unsafe_xurl_rejection_even_in_non_tty(capsys):
+    """Security-class drops must be observable in non-interactive runs.
+
+    The default ``log.source_log`` path is TTY-gated; without forcing
+    ``tty_only=False`` the rejection is invisible in Claude Code runs,
+    which is exactly the attack surface. Guard against silent regression.
+    """
+    digg._parse_post(_post(x_url="javascript:alert(1)"))
+    err = capsys.readouterr().err
+    assert "[Digg] dropped post with unsafe xUrl scheme" in err
+    assert "javascript:alert(1)" in err
+
+
 # === _run_cli / search_digg with stubbed subprocess ===
 
 
@@ -230,6 +267,7 @@ def test_search_digg_passes_since_30d(monkeypatch):
     assert captured["cmd"][captured["cmd"].index("--since") + 1] == "30d"
     assert "--agent" in captured["cmd"]
     assert captured["cmd"][:3] == [digg.CLI_BIN, "search", "openclaw"]
+    assert captured["cmd"][captured["cmd"].index("--topic") + 1] == "ai,tech"
 
 
 def test_search_digg_subproc_timeout_returns_empty(monkeypatch):
@@ -275,6 +313,136 @@ def test_search_digg_empty_query_short_circuits(monkeypatch):
     out = digg.search_digg("", "2026-04-09", "2026-05-09")
     assert out["results"] == []
     called.assert_not_called()
+
+
+_REAL_FALLBACK_STDERR = (
+    "falling back to local FTS5: GET https://di.gg/api/search/stories: HTTP 404: "
+    '<!DOCTYPE html><html data-dpl-id="dpl_x" lang="en" class="font-sans">'
+    + "x" * 500
+    + "\n"
+)
+
+
+def _real_fallback_result() -> subproc.SubprocResult:
+    """digg-pp-cli 2026.9.1 output when the live API 404s: exit 0, no meta.reason."""
+    return subproc.SubprocResult(
+        returncode=0,
+        stdout=json.dumps(
+            {
+                "meta": {
+                    "count": 0,
+                    "query": "openai",
+                    "since": "30d",
+                    "source": "local",
+                },
+                "results": [],
+            }
+        ),
+        stderr=_REAL_FALLBACK_STDERR,
+    )
+
+
+def test_search_digg_real_fallback_reports_stderr_reason(monkeypatch):
+    """A live search that fell back to an empty local store is not 'no results'."""
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc, "run_with_timeout", lambda *a, **k: _real_fallback_result()
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert out["results"] == []
+    assert out["error"] == (
+        "live-search-unavailable: GET https://di.gg/api/search/stories: HTTP 404"
+    )
+
+
+def test_real_fallback_reason_reaches_source_outcome(monkeypatch):
+    from lib import pipeline
+
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc, "run_with_timeout", lambda *a, **k: _real_fallback_result()
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    outcome = pipeline._result_outcome_artifact("digg", out)["_source_outcome"]
+    assert outcome["state"] == "error"
+    assert "HTTP 404" in outcome["detail"]
+    assert "<!DOCTYPE" not in outcome["detail"]
+
+
+def test_local_fallback_reason_bounds_non_http_errors():
+    stderr = "noise\nfalling back to local FTS5: dial tcp: " + "y" * 1000 + "\n"
+    reason = digg._local_fallback_reason(stderr)
+    assert reason.startswith("dial tcp: ")
+    assert len(reason) <= digg._FALLBACK_REASON_MAX
+
+
+def test_search_digg_empty_local_fallback_prefers_meta_reason(monkeypatch):
+    """meta.reason is not emitted by digg-pp-cli 2026.9.1; prefer it if a later release adds it."""
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: subproc.SubprocResult(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "meta": {
+                        "source": "local",
+                        "reason": "GET https://di.gg/api/search/stories: HTTP 404",
+                    },
+                    "results": [],
+                }
+            ),
+            stderr="falling back to local FTS5: stderr reason\n",
+        ),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert out["results"] == []
+    assert out["error"] == (
+        "live-search-unavailable: GET https://di.gg/api/search/stories: HTTP 404"
+    )
+
+
+def test_search_digg_empty_local_fallback_without_reason_still_errors(monkeypatch):
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _stdout_for({"meta": {"source": "local"}, "results": []}),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert out["results"] == []
+    assert "live-search-unavailable" in out["error"]
+
+
+def test_search_digg_local_fallback_with_rows_keeps_results(monkeypatch):
+    """A user who ran `digg-pp-cli sync` still gets their local clusters."""
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _stdout_for(
+            {"meta": {"source": "local"}, "results": [_cluster()]}
+        ),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert len(out["results"]) == 1
+    assert "error" not in out
+
+
+def test_search_digg_live_empty_is_still_no_results(monkeypatch):
+    """A live search that genuinely found nothing stays a clean empty."""
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _stdout_for(
+            {"meta": {"source": "live", "count": 0}, "results": []}
+        ),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert out["results"] == []
+    assert "error" not in out
 
 # === enrich_with_top_posts ===
 
@@ -449,3 +617,117 @@ class TestLiveDigg:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# === digg-pp-cli 2026.10.1+ envelopes (local feed copy with meta.stale) ===
+
+
+def _feed_envelope(*, source: str, stale: bool, results: list) -> subproc.SubprocResult:
+    return _stdout_for(
+        {
+            "meta": {
+                "count": len(results),
+                "query": "openai",
+                "since": "30d",
+                "source": source,
+                "stale": stale,
+                "topics": ["ai", "tech"],
+            },
+            "results": results,
+        }
+    )
+
+
+def test_search_digg_fresh_local_empty_is_no_matches(monkeypatch):
+    """A synced store with nothing matching is a real empty answer, not a fallback."""
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _feed_envelope(source="local", stale=False, results=[]),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert out["results"] == []
+    assert "error" not in out
+    assert digg.stale_note(out) is None
+
+
+def test_search_digg_stale_result_keeps_items_and_notes_sync(monkeypatch):
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _feed_envelope(
+            source="local+live", stale=True, results=[_cluster()]
+        ),
+    )
+    out = digg.search_digg("openai", "2026-04-09", "2026-05-09")
+    assert len(out["results"]) == 1
+    note = digg.stale_note(out)
+    assert note is not None
+    assert "digg-pp-cli sync --topics ai,tech" in note
+
+
+def test_stale_note_ignores_old_envelopes():
+    assert digg.stale_note({"results": []}) is None
+    assert digg.stale_note({"meta": {"source": "local"}, "results": []}) is None
+    assert digg.stale_note({"meta": {"stale": "true"}, "results": []}) is None
+
+
+def test_stale_search_marks_digg_partial_in_pipeline(monkeypatch):
+    from lib import health, pipeline, schema
+
+    monkeypatch.setattr(digg.shutil, "which", lambda _: "/fake/path")
+    monkeypatch.setattr(
+        digg.subproc,
+        "run_with_timeout",
+        lambda *a, **k: _feed_envelope(
+            source="local+live", stale=True, results=[_cluster()]
+        ),
+    )
+    subquery = schema.SubQuery(
+        label="primary",
+        search_query="openai",
+        ranking_query="openai",
+        sources=["digg"],
+    )
+    items, artifact = pipeline._retrieve_stream_impl(
+        topic="openai",
+        subquery=subquery,
+        source="digg",
+        config={},
+        depth="default",
+        date_range=("2026-04-09", "2026-05-09"),
+        runtime=None,
+        mock=False,
+    )
+    assert len(items) == 1
+    outcome = artifact["_source_outcome"]
+    assert outcome["state"] == health.PARTIAL
+    assert "sync --topics ai,tech" in outcome["detail"]
+
+
+def test_stale_partial_with_no_items_finalizes_as_no_results():
+    """A stale search that matched nothing keeps its sync note and is not an error."""
+    from lib import health, pipeline, schema
+
+    outcomes = {
+        "digg": schema.SourceOutcome(
+            source="digg",
+            state=health.PARTIAL,
+            items_returned=0,
+            attempted=True,
+            detail=digg.STALE_NOTE,
+        ),
+        "reddit": schema.SourceOutcome(
+            source="reddit",
+            state=health.PARTIAL,
+            items_returned=0,
+            attempted=True,
+            detail="HTTP 503 from upstream",
+        ),
+    }
+    final = pipeline._finalize_source_status(outcomes, {})
+    assert final["digg"].state == schema.NO_RESULTS
+    assert final["digg"].detail == digg.STALE_NOTE
+    assert final["reddit"].state != schema.NO_RESULTS

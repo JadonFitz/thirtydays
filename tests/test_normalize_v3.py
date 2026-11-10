@@ -45,6 +45,32 @@ class NormalizeV3Tests(unittest.TestCase):
         )
         self.assertEqual([], normalized)
 
+    def test_arxiv_keeps_adapter_valid_items_older_than_report_window(self):
+        items = [
+            {
+                "id": "http://arxiv.org/abs/2509.00001v1",
+                "title": "Reliable Agent Memory",
+                "url": "https://arxiv.org/abs/2509.00001v1",
+                "summary": "A study of memory systems for coding agents.",
+                "author": "Ada Lovelace",
+                "authors": ["Ada Lovelace"],
+                "date": "2025-09-04",
+                "relevance": 0.9,
+            }
+        ]
+
+        normalized = normalize.normalize_source_items(
+            "arxiv",
+            items,
+            "2026-07-06",
+            "2026-08-05",
+        )
+
+        self.assertEqual(1, len(normalized))
+        self.assertEqual("Reliable Agent Memory", normalized[0].title)
+        self.assertEqual("https://arxiv.org/abs/2509.00001v1", normalized[0].url)
+        self.assertEqual("2025-09-04", normalized[0].published_at)
+
     def test_youtube_top_comments_passthrough_with_field_mapping(self):
         """YT comments from enrich_with_comments use likes/text; normalize must
         carry them into metadata as the Reddit-compatible {score, excerpt} shape."""
@@ -78,6 +104,33 @@ class NormalizeV3Tests(unittest.TestCase):
         # Preserves ordering from input (already sorted desc upstream)
         self.assertEqual(45, top[1]["score"])
         self.assertEqual(7, top[2]["score"])
+
+    def test_instagram_comment_like_count_maps_to_score(self):
+        """U2: IG comments use comment_like_count as the vote; normalize must
+        carry it into the shared `score` field so it participates in ranking."""
+        items = [
+            {
+                "video_id": "ig-1",
+                "text": "reel caption",
+                "url": "https://www.instagram.com/reel/ABC/",
+                "author_name": "example",
+                "date": "2026-03-01",
+                "engagement": {"views": 10000, "likes": 500, "comments": 30},
+                "top_comments": [
+                    {"author": "alice", "text": "gold take", "comment_like_count": 120, "date": "2026-03-02"},
+                    {"author": "bob", "text": "mid", "comment_like_count": 5, "date": "2026-03-03"},
+                ],
+            }
+        ]
+        normalized = normalize.normalize_source_items(
+            "instagram", items, "2026-02-15", "2026-03-17",
+        )
+        self.assertEqual(1, len(normalized))
+        top = normalized[0].metadata.get("top_comments")
+        self.assertIsNotNone(top)
+        self.assertEqual(120, top[0]["score"])
+        self.assertEqual("gold take", top[0]["excerpt"])
+        self.assertEqual("alice", top[0]["author"])
 
     def test_youtube_top_comments_empty_list_passes_through_cleanly(self):
         items = [
@@ -209,8 +262,8 @@ class NormalizeV3Tests(unittest.TestCase):
             {
                 "id": "g-1",
                 "title": "Undated result",
-                "url": "https://example.com/undated",
-                "snippet": "No date attached.",
+                "url": "https://example.com/post",
+                "snippet": "No date was returned.",
             }
         ]
         normalized = normalize.normalize_source_items(
@@ -220,6 +273,149 @@ class NormalizeV3Tests(unittest.TestCase):
             "2026-03-17",
         )
         self.assertEqual([], normalized)
+
+    def test_grounding_keeps_undated_keyless_current_window_results(self):
+        items = [
+            {
+                "id": "WK1",
+                "title": "Undated keyless result",
+                "url": "https://example.com/post",
+                "snippet": "Keyless backends return no date.",
+                "metadata": {"date_window_basis": "keyless_current"},
+            }
+        ]
+        normalized = normalize.normalize_source_items(
+            "grounding",
+            items,
+            "2026-02-15",
+            "2026-03-17",
+        )
+        self.assertEqual(1, len(normalized))
+        self.assertIsNone(normalized[0].published_at)
+        self.assertEqual("low", normalized[0].date_confidence)
+
+    def test_grounding_still_drops_known_out_of_window_dates(self):
+        items = [
+            {
+                "id": "g-old",
+                "title": "Old dated result",
+                "url": "https://example.com/old",
+                "snippet": "Dated before the window.",
+                "date": "2025-01-10",
+            },
+            {
+                "id": "g-new",
+                "title": "In-window dated result",
+                "url": "https://example.com/new",
+                "snippet": "Dated inside the window.",
+                "date": "2026-03-01",
+            },
+        ]
+        normalized = normalize.normalize_source_items(
+            "grounding",
+            items,
+            "2026-02-15",
+            "2026-03-17",
+        )
+        self.assertEqual(["https://example.com/new"], [item.url for item in normalized])
+
+    def test_youtube_recent_modes_drop_transcribed_older_items_when_date_window_is_empty(self):
+        """#1043 rescue is scoped to evergreen_ok: recent topics get an honest empty result."""
+        items = [
+            {
+                "video_id": "vid-old",
+                "title": "Ghost in the Shell review",
+                "url": "https://youtube.com/watch?v=vid-old",
+                "channel_name": "Example",
+                "date": "2017-03-01",
+                "transcript_snippet": "Fetched transcript about Ghost in the Shell.",
+                "engagement": {"views": 1000, "likes": 50, "comments": 10},
+            }
+        ]
+        for mode in ("balanced_recent", "strict_recent"):
+            normalized = normalize.normalize_source_items(
+                "youtube",
+                items,
+                "2026-02-15",
+                "2026-03-17",
+                freshness_mode=mode,
+            )
+            self.assertEqual([], normalized, mode)
+
+    def test_youtube_evergreen_keeps_transcribed_older_items_when_date_window_is_empty(self):
+        """#1043: evergreen search kept out-of-window videos so transcripts could run; normalize must not drop them."""
+        items = [
+            {
+                "video_id": "vid-old",
+                "title": "Informa TechTarget overview",
+                "url": "https://youtube.com/watch?v=vid-old",
+                "channel_name": "Example",
+                "date": "2025-01-10",
+                "transcript_snippet": "Fetched transcript about Informa TechTarget.",
+                "engagement": {"views": 1000, "likes": 50, "comments": 10},
+            }
+        ]
+        normalized = normalize.normalize_source_items(
+            "youtube",
+            items,
+            "2026-02-15",
+            "2026-03-17",
+            freshness_mode="evergreen_ok",
+        )
+        self.assertEqual(1, len(normalized))
+        self.assertEqual("vid-old", normalized[0].item_id)
+        self.assertIn("Fetched transcript", normalized[0].snippet)
+
+    def test_youtube_empty_window_fallback_keeps_only_transcribed_items(self):
+        """#1043 rescue is transcript-backed evidence, not stale metadata-only videos."""
+        items = [
+            {
+                "video_id": "vid-meta",
+                "title": "Old video without captions",
+                "url": "https://youtube.com/watch?v=vid-meta",
+                "channel_name": "Example",
+                "date": "2025-01-10",
+                "engagement": {"views": 1000, "likes": 50, "comments": 10},
+            },
+            {
+                "video_id": "vid-old",
+                "title": "Informa TechTarget overview",
+                "url": "https://youtube.com/watch?v=vid-old",
+                "channel_name": "Example",
+                "date": "2025-01-10",
+                "transcript_snippet": "Fetched transcript about Informa TechTarget.",
+                "engagement": {"views": 1000, "likes": 50, "comments": 10},
+            },
+        ]
+        normalized = normalize.normalize_source_items(
+            "youtube",
+            items,
+            "2026-02-15",
+            "2026-03-17",
+            freshness_mode="evergreen_ok",
+        )
+        self.assertEqual(1, len(normalized))
+        self.assertEqual("vid-old", normalized[0].item_id)
+
+    def test_youtube_empty_window_fallback_drops_all_transcript_free_videos(self):
+        items = [
+            {
+                "video_id": "vid-meta",
+                "title": "Old video without captions",
+                "url": "https://youtube.com/watch?v=vid-meta",
+                "channel_name": "Example",
+                "date": "2025-01-10",
+            }
+        ]
+        normalized = normalize.normalize_source_items(
+            "youtube",
+            items,
+            "2026-02-15",
+            "2026-03-17",
+            freshness_mode="strict_recent",
+        )
+        self.assertEqual([], normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

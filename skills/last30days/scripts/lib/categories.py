@@ -23,6 +23,7 @@ before `ai_chat_model` so "gpt image 2" matches the image-gen category.
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional, TypedDict
 
 
@@ -126,6 +127,8 @@ CATEGORY_PEERS: dict[str, _CategoryEntry] = {
     },
     "ai_agent_framework": {
         "patterns": [
+            "ai agent",
+            "ai agents",
             "agent framework",
             "agentic framework",
             "langchain",
@@ -247,13 +250,19 @@ CATEGORY_PEERS: dict[str, _CategoryEntry] = {
 }
 
 
+# Single-word patterns are mostly brands whose plural is another word ("SunOS",
+# "yoga asanas"), so only compound terms and these generic words take an "s".
+_PLURAL_WORDS = frozenset({"stablecoin"})
+
+
 def detect_category(topic: Optional[str]) -> Optional[str]:
     """Classify a topic into a known category by compound-term match.
 
     Returns the category id (e.g. "ai_image_generation") or None if no
-    category's patterns match. Matching is case-insensitive substring over
-    the lowercased topic. Declaration order wins (first-match-wins), so the
-    map is ordered from most-specific to least-specific.
+    category's patterns match. Matching is a case-insensitive word-boundary
+    match over the lowercased topic; compound terms also match a plural "s".
+    Declaration order wins (first-match-wins), so the map is ordered from
+    most-specific to least-specific.
 
     A None or empty topic returns None. Classification never raises on
     normal string inputs; callers do not need to wrap in try/except for
@@ -264,7 +273,12 @@ def detect_category(topic: Optional[str]) -> Optional[str]:
     lowered = topic.lower()
     for category_id, entry in CATEGORY_PEERS.items():
         for pattern in entry["patterns"]:
-            if pattern in lowered:
+            # Word-boundary match: "ai agent" must not fire on "Dubai agents"
+            # or "Thai agents". Substring matching classified those as
+            # ai_agent_framework and routed discovery to LangChain subreddits.
+            pluralizes = " " in pattern or pattern in _PLURAL_WORDS
+            plural = "s?" if pluralizes else ""
+            if re.search(rf"(?<![a-z0-9]){re.escape(pattern)}{plural}(?![a-z0-9])", lowered):
                 return category_id
     return None
 

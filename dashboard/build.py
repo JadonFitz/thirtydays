@@ -106,8 +106,9 @@ def extract_date(filename: str):
 
 
 def display_name(stem: str) -> str:
-    name = re.sub(r"-raw-v\d+", "", stem)
-    name = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", name)
+    # Saved briefs are named <slug>-raw[-suffix][-YYYY-MM-DD].md
+    name = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", stem)
+    name = re.sub(r"-raw(-[a-z0-9]+)?$", "", name)
     return name.replace("-", " ").title()
 
 

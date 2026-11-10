@@ -151,6 +151,22 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
         self.assertIn("<h2>What I learned</h2>", rendered)
         self.assertNotIn("What I learned:", rendered)
 
+    def test_claude_code_list_free_markers_render_as_lists(self):
+        # On Claude Code the chat report writes `1\.` and `• ` instead of
+        # markdown lists; the export copies that text verbatim.
+        md = "KEY PATTERNS:\n1\\. First, per [CNN](https://example.test/a)\n2\\. Second\n\nAsk me:\n• Go deeper\n• Compare"
+        rendered = html_render._markdown_to_html(md)
+        self.assertIn("<ol>\n<li>First, per", rendered)
+        self.assertIn("<li>Second</li>\n</ol>", rendered)
+        self.assertIn("<ul>\n<li>Go deeper</li>\n<li>Compare</li>\n</ul>", rendered)
+        self.assertNotIn("\\.", rendered)
+        self.assertNotIn("•", rendered)
+
+    def test_list_free_markers_inside_code_are_left_alone(self):
+        rendered = html_render._markdown_to_html("```\n• keep\n1\\. keep\n```")
+        self.assertIn("• keep", rendered)
+        self.assertIn("1\\. keep", rendered)
+
     def test_invitation_strip(self):
         md = "---\nI'm now an expert on OpenClaw. Some things you could ask:\n\nJust ask."
         self.assertNotIn("I'm now an expert", html_render._strip_invitation(md))
@@ -175,6 +191,36 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
         self.assertIn("├─ 🔵 X: 2 posts", body)
         self.assertIn("└─ 🌐 Web: 1 result", body)
 
+    def test_fenced_engine_footer_wrapping_preserves_tree(self):
+        md = (
+            "```text\n"
+            "---\n"
+            "✅ All agents reported back!\n"
+            "├─ 🔵 X: 2 posts\n"
+            "└─ 🌐 Web: 1 result\n"
+            "---\n"
+            "```"
+        )
+        body = html_render._wrap_engine_footer(html_render._markdown_to_html(md))
+        self.assertIn('<div class="engine-footer"><pre>---\n✅ All agents reported back!', body)
+        self.assertIn("├─ 🔵 X: 2 posts", body)
+        self.assertIn("└─ 🌐 Web: 1 result", body)
+
+    def test_fenced_footer_match_does_not_swallow_an_earlier_text_block(self):
+        md = (
+            "```text\n---\nquoted by the synthesis\n---\n```\n\n"
+            "Prose between the blocks.\n\n"
+            "```text\n---\n✅ All agents reported back!\n└─ 🌐 Web: 1 result\n---\n```"
+        )
+        matches = list(html_render.FENCED_ENGINE_FOOTER_PATTERN.finditer(md))
+        self.assertEqual(len(matches), 1)
+        self.assertNotIn("Prose between the blocks.", matches[0].group(0))
+        self.assertNotIn("quoted by the synthesis", matches[0].group(0))
+
+        protected, footers = html_render._protect_engine_footers(md)
+        self.assertIn("Prose between the blocks.", protected)
+        self.assertEqual(len(footers), 1)
+
     def test_colophon_contains_topic_and_rerun_command(self):
         rendered = html_render.render_html(_report("AI agent frameworks", []))
         self.assertIn("topic: AI agent frameworks", rendered)
@@ -186,11 +232,106 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
     def test_self_containedness(self):
         rendered = html_render.render_html(_report("self contained", []))
         self.assertNotIn("<script", rendered.lower())
-        self.assertEqual(1, rendered.count('rel="stylesheet"'))
+        self.assertEqual(0, rendered.count('rel="stylesheet"'))
+        self.assertNotIn("fonts.googleapis.com", rendered)
+        self.assertNotIn("fonts.gstatic.com", rendered)
+        self.assertNotIn('rel="preconnect"', rendered)
 
     def test_markdown_links_convert(self):
         rendered = html_render._markdown_to_html("[name](https://example.test/path)")
-        self.assertIn('<a href="https://example.test/path">name</a>', rendered)
+        self.assertIn(
+            '<a href="https://example.test/path" rel="noopener noreferrer">name</a>',
+            rendered,
+        )
+
+    def test_markdown_links_reject_javascript_scheme(self):
+        """A `[label](javascript:...)` link must NOT render as a clickable href.
+
+        The HTML artifact is opened in a browser, so allowing arbitrary URL
+        schemes turns synthesized markdown into a stored-XSS surface. External
+        sources (Reddit, X, HN, etc.) can plant such links and the LLM may
+        carry them through synthesis; the renderer is the last gate.
+        """
+        for payload in (
+            "[click](javascript:alert(1))",
+            "[click](JAVASCRIPT:alert(1))",
+            "[click](vbscript:alert(1))",
+            "[click](file:///etc/passwd)",
+        ):
+            rendered = html_render._markdown_to_html(payload)
+            self.assertNotIn("<a ", rendered, msg=f"payload accepted: {payload}")
+            self.assertNotIn("href=", rendered, msg=f"payload accepted: {payload}")
+            # The label still surfaces as plain text so context isn't lost.
+            self.assertIn("click", rendered, msg=f"label dropped: {payload}")
+
+    def test_markdown_links_reject_data_uri(self):
+        rendered = html_render._markdown_to_html(
+            "[click](data:text/html,<svg/onload=alert(1)>)"
+        )
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("href=", rendered)
+        # The label still surfaces as plain text so context isn't lost.
+        self.assertIn("click", rendered)
+
+    def test_markdown_links_strip_leading_whitespace_javascript(self):
+        """Leading whitespace in the URL must not let a `javascript:` payload
+        bypass the scheme check (browsers strip leading whitespace before
+        parsing the scheme)."""
+        rendered = html_render._markdown_to_html("[click](\tjavascript:alert(1))")
+        # `[^)\\s]+` already rejects whitespace inside the URL, so the regex
+        # doesn't match and the label is left as plain text. The point of the
+        # assertion is to pin that behavior: NO `<a href>` is produced.
+        self.assertNotIn("<a ", rendered)
+        self.assertNotIn("href=", rendered)
+
+    def test_meta_marker_escapes_payload_through_pipeline(self):
+        """A META marker carrying markup must not render as live HTML.
+
+        The marker is exempted from the comment-strip pass and promoted into a
+        <div class="meta">. Its text can come from LLM-synthesized content
+        derived from untrusted source bodies, so a crafted
+        `<!-- META: <img src=x onerror=...> -->` must be escaped, not rendered.
+        """
+        md = "intro\n\n<!-- META: <img src=x onerror=alert(1)> -->\n\nmore"
+        body = html_render._markdown_to_html(md)
+        body = html_render._wrap_engine_footer(body)
+        body = html_render._promote_meta_marker(body)
+        self.assertNotIn("<img", body)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", body)
+
+    def test_meta_marker_escapes_raw_fallback(self):
+        """The raw (unescaped) META fallback path must also escape its payload."""
+        body = html_render._promote_meta_marker(
+            "<!-- META: <img src=x onerror=alert(1)> -->"
+        )
+        self.assertNotIn("<img", body)
+        self.assertEqual(
+            body, '<div class="meta">&lt;img src=x onerror=alert(1)&gt;</div>'
+        )
+
+    def test_meta_marker_preserves_plain_text(self):
+        """Legitimate date/source-name markers render unchanged (no double-escape)."""
+        body = html_render._promote_meta_marker(
+            "<!-- META: 2026-01-01 to 2026-01-31 · reddit, x -->"
+        )
+        self.assertEqual(
+            body,
+            '<div class="meta">2026-01-01 to 2026-01-31 · reddit, x</div>',
+        )
+
+    def test_markdown_links_allow_relative_url(self):
+        rendered = html_render._markdown_to_html("[home](/path?x=1#section)")
+        self.assertIn(
+            '<a href="/path?x=1#section" rel="noopener noreferrer">home</a>',
+            rendered,
+        )
+
+    def test_markdown_links_allow_mailto(self):
+        rendered = html_render._markdown_to_html("[mail](mailto:a@example.com)")
+        self.assertIn(
+            '<a href="mailto:a@example.com" rel="noopener noreferrer">mail</a>',
+            rendered,
+        )
 
     def test_no_file_header_h1(self):
         rendered = html_render.render_html(_report("AI agent frameworks", ["One"]))
@@ -207,7 +348,10 @@ class HtmlRenderBehaviorTests(unittest.TestCase):
             synthesis_md=synthesis,
         )
         self.assertIn("<strong>Test brief</strong> - body content per", rendered)
-        self.assertIn('<a href="https://example.com">@example</a>', rendered)
+        self.assertIn(
+            '<a href="https://example.com" rel="noopener noreferrer">@example</a>',
+            rendered,
+        )
         metadata_index = rendered.index('<div class="meta">')
         synthesis_index = rendered.index("<strong>Test brief</strong>")
         footer_index = rendered.index('<div class="engine-footer">')
@@ -271,6 +415,35 @@ class HtmlCliIntegrationTests(unittest.TestCase):
         with self.subTest("suffix"):
             path = cli.compute_save_path_display("/tmp", report.topic, "v3", "html")
             self.assertTrue(path.endswith("/ai-agent-frameworks-raw-html-v3.html"))
+        with self.subTest("suffix_traversal_sanitized"):
+            # A suffix carrying path separators / parent refs must be sanitized
+            # to a flat token so it can never escape the save directory.
+            path = cli.compute_save_path_display("/tmp", report.topic, "../../etc", "html")
+            self.assertNotIn("..", path)
+            self.assertTrue(path.endswith("/ai-agent-frameworks-raw-html-etc.html"))
+
+    def test_save_suffix_cannot_escape_save_directory(self):
+        report = _report("AI Agent Frameworks", [])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = cli.save_output(report, "md", tmpdir, suffix="../../ESCAPED")
+            # The written file stays inside the intended directory, and the
+            # traversal fragment never lands in the filename.
+            self.assertEqual(Path(tmpdir).resolve(), out.parent)
+            self.assertNotIn("..", out.name)
+            self.assertTrue(out.name.startswith("ai-agent-frameworks-raw"))
+
+    def test_discover_save_suffix_cannot_escape_save_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = cli._save_discovery_output(
+                "# discovery\n",
+                domain="AI agents",
+                emit="md",
+                save_dir=tmpdir,
+                suffix="../../ESCAPED",
+            )
+            self.assertEqual(Path(tmpdir).resolve(), out.parent)
+            self.assertNotIn("..", out.name)
+            self.assertTrue(out.name.startswith("ai-agents-discover-raw"))
 
     def test_save_output_can_persist_comparison_html(self):
         reports = [
