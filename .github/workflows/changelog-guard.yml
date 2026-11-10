@@ -14,6 +14,8 @@ permissions: {}
 
 jobs:
   guard:
+    # Upstream maintainer check; skipped on this fork.
+    if: github.repository == 'mvanhorn/last30days-skill'
     runs-on: ubuntu-latest
     permissions:
       contents: read

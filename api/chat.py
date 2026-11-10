@@ -55,7 +55,14 @@ class handler(BaseHTTPRequestHandler):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read())
-            reply = data["content"][0]["text"]
+            # Join every text block; don't assume the first block is text.
+            reply = "".join(
+                b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
+            ).strip()
+            if not reply:
+                stop = data.get("stop_reason")
+                self._json({"error": f"No text in model response (stop_reason: {stop})"}, 502)
+                return
             self._json({"reply": reply})
         except urllib.error.HTTPError as e:
             err = e.read().decode()

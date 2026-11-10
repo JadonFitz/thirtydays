@@ -26,6 +26,8 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
+    # Upstream maintainer check; skipped on this fork.
+    if: github.repository == 'mvanhorn/last30days-skill'
     runs-on: ubuntu-latest
     # Job-level permissions fully replace the top-level block (unlisted scopes
     # default to none), so the reads checkout and Scorecard need are explicit.

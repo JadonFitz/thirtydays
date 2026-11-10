@@ -1,5 +1,8 @@
 name: Auto Research
 
+# Runs /last30days headlessly on a schedule, saves each brief to research/,
+# and commits the new files so the Vercel dashboard picks them up.
+
 on:
   schedule:
     # 1st and 15th of each month at 9:00 AM UTC
@@ -11,51 +14,92 @@ on:
         required: false
         default: ""
 
+permissions: {}
+
+concurrency:
+  group: auto-research
+  cancel-in-progress: false
+
 jobs:
   research:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      # Needed to commit the new research files back to the branch.
+      contents: write
     env:
+      # Optional source keys. Any that are not set as repository secrets are
+      # skipped; Reddit, Hacker News, Polymarket and GitHub work without them.
       SCRAPECREATORS_API_KEY: ${{ secrets.SCRAPECREATORS_API_KEY }}
       BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # Unlocks the GitHub source and avoids the anonymous search limit.
+      GITHUB_TOKEN: ${{ github.token }}
+      # Headless cron run: let the engine write its own query plan.
+      LAST30DAYS_ALLOW_ENGINE_PLAN: "1"
+      # Keep briefs out of the runner's ~/Documents default.
       LAST30DAYS_MEMORY_DIR: ${{ github.workspace }}/research
+      DEFAULT_TOPICS: "BTC market sentiment,ETH DeFi narrative,altcoin season signals,crypto macro 2026"
+      INPUT_TOPICS: ${{ github.event.inputs.topics }}
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.12"
-          cache: "pip"
+          persist-credentials: false
 
-      - name: Install dependencies
-        run: |
-          pip install -r skills/last30days/scripts/requirements.txt 2>/dev/null || true
-          pip install uv
-          uv sync --frozen 2>/dev/null || true
+      - name: Install yt-dlp (free YouTube source)
+        run: pipx install yt-dlp || echo "yt-dlp install failed; YouTube will be skipped"
 
-      - name: Run crypto research
+      - name: Run research
         run: |
-          TOPICS="${{ github.event.inputs.topics }}"
-          if [ -z "$TOPICS" ]; then
-            TOPICS="BTC market sentiment,ETH DeFi narrative,altcoin season signals,crypto macro 2026"
+          set -uo pipefail
+          python3 --version
+          TOPICS="${INPUT_TOPICS:-}"
+          if [ -z "${TOPICS}" ]; then
+            TOPICS="${DEFAULT_TOPICS}"
           fi
-          IFS=',' read -ra TOPIC_ARR <<< "$TOPICS"
+          mkdir -p research
+          IFS=',' read -ra TOPIC_ARR <<< "${TOPICS}"
+          ok=0
+          failed=0
           for topic in "${TOPIC_ARR[@]}"; do
-            topic=$(echo "$topic" | xargs)
-            echo "── Researching: $topic"
-            python3 skills/last30days/scripts/last30days.py "$topic" --emit=compact || true
+            topic="$(echo "${topic}" | xargs)"
+            [ -z "${topic}" ] && continue
+            echo "::group::Researching: ${topic}"
+            if python3 skills/last30days/scripts/last30days.py "${topic}" \
+                --emit=compact \
+                --save-dir research \
+                --no-browser-cookies \
+                --research-only; then
+              ok=$((ok + 1))
+            else
+              failed=$((failed + 1))
+              echo "::warning::Research failed for topic: ${topic}"
+            fi
+            echo "::endgroup::"
             sleep 5
           done
+          echo "Topics finished: ${ok} ok, ${failed} failed"
+          if [ "${ok}" -eq 0 ]; then
+            echo "::error::Every research topic failed"
+            exit 1
+          fi
 
       - name: Commit and push research
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           git config user.name  "last30days-bot"
-          git config user.email "bot@last30days"
-          git add research/
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add research/*.md
           if git diff --staged --quiet; then
             echo "No new research files to commit."
-          else
-            git commit -m "research: auto-update $(date +%Y-%m-%d)"
-            git push
+            exit 0
           fi
+          git commit -m "research: auto-update $(date -u +%Y-%m-%d)"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git" "HEAD:${BRANCH}"
