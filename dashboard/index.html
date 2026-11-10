@@ -266,6 +266,19 @@ main{flex:1;padding:16px;max-width:600px;margin:0 auto;width:100%}
 .btn-primary{background:var(--green);color:#000}
 .btn-secondary{background:var(--s2);color:var(--t2);border:1px solid var(--b1)}
 .field .hint{font-size:11px;color:var(--t3);margin-top:5px}
+.run-btn{
+  background:none;border:1px solid var(--b1);border-radius:8px;
+  color:var(--green);padding:6px 10px;font-size:13px;font-weight:600;cursor:pointer;
+  transition:all .15s;
+}
+.run-btn:hover{border-color:var(--b2)}
+.run-status{font-size:13px;color:var(--t2);padding:4px 0;line-height:1.5}
+.run-status a{color:var(--blue)}
+.run-status .ok{color:var(--green)}
+.run-status .bad{color:var(--red)}
+.run-remember{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--t2);margin-top:8px}
+.run-remember input{width:auto}
+.btn:disabled{opacity:.5;cursor:default}
 
 /* TOAST */
 #toast{
@@ -284,6 +297,7 @@ main{flex:1;padding:16px;max-width:600px;margin:0 auto;width:100%}
   <div class="logo">last<em>30</em>days</div>
   <div class="hdr-right">
     <div class="sync-dot" id="sync-dot" title="Data freshness"></div>
+    <button class="run-btn" onclick="openRun()" aria-label="Run research">▶ Run</button>
     <button class="settings-btn" onclick="openSettings()">⚙</button>
   </div>
 </header>
@@ -307,6 +321,31 @@ main{flex:1;padding:16px;max-width:600px;margin:0 auto;width:100%}
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="closeSettings()">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Run Research Modal -->
+<div class="modal-bg" id="run-modal" onclick="closeRun(event)">
+  <div class="modal">
+    <h2>Run research</h2>
+    <div class="field">
+      <label>Latest run</label>
+      <div class="run-status" id="run-status">Enter your passcode to see it.</div>
+    </div>
+    <div class="field">
+      <label for="run-pass">Passcode</label>
+      <input id="run-pass" type="password" autocomplete="current-password" placeholder="passcode">
+      <label class="run-remember"><input type="checkbox" id="run-remember"> Remember on this device</label>
+    </div>
+    <div class="field">
+      <label for="run-topics">Topics (optional)</label>
+      <input id="run-topics" placeholder="leave blank for your default topics">
+      <div class="hint">Comma separated. Takes a few minutes; new briefs show up here once the site redeploys.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeRun()">Close</button>
+      <button class="btn btn-primary" id="run-go" onclick="startRun()">Run now</button>
     </div>
   </div>
 </div>
@@ -705,6 +744,85 @@ function openSettings() {
 function closeSettings(e) {
   if (!e || e.target===document.getElementById("settings-modal"))
     document.getElementById("settings-modal").classList.remove("open");
+}
+
+// ── RUN RESEARCH ──────────────────────────────────────────────────────────────
+const RUN_PASS_KEY = "run_passcode";
+let runPoll = null;
+
+function savedPass() { try { return localStorage.getItem(RUN_PASS_KEY) || ""; } catch { return ""; } }
+function openRun() {
+  const saved = savedPass();
+  document.getElementById("run-pass").value = saved;
+  document.getElementById("run-remember").checked = !!saved;
+  document.getElementById("run-modal").classList.add("open");
+  if (saved) refreshRun();
+}
+function closeRun(e) {
+  if (!e || e.target===document.getElementById("run-modal")) {
+    document.getElementById("run-modal").classList.remove("open");
+    clearInterval(runPoll); runPoll = null;
+  }
+}
+function runPass() {
+  const v = document.getElementById("run-pass").value.trim();
+  try {
+    if (document.getElementById("run-remember").checked && v) localStorage.setItem(RUN_PASS_KEY, v);
+    else localStorage.removeItem(RUN_PASS_KEY);
+  } catch {}
+  return v;
+}
+function setRunStatus(html) { document.getElementById("run-status").innerHTML = html; }
+function describeRun(run) {
+  if (!run) return "No runs yet.";
+  const when = run.created_at ? new Date(run.created_at).toLocaleString() : "";
+  const link = run.url ? ` · <a href="${escHtml(run.url)}" target="_blank" rel="noopener">details</a>` : "";
+  let state;
+  if (run.status !== "completed") state = `<b>${escHtml(run.status==="in_progress"?"Running":"Queued")}</b>`;
+  else if (run.conclusion === "success") state = `<span class="ok">Finished</span>`;
+  else state = `<span class="bad">${escHtml(run.conclusion || "Failed")}</span>`;
+  return `${state} · started ${escHtml(when)}${link}`;
+}
+async function runApi(method, body) {
+  const pass = runPass();
+  if (!pass) { setRunStatus('<span class="bad">Enter your passcode first.</span>'); return null; }
+  const res = await fetch("/api/research", {
+    method,
+    headers: { "Content-Type": "application/json", "X-Passcode": pass },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let data = {};
+  try { data = await res.json(); } catch {}
+  return { ok: res.ok, status: res.status, data };
+}
+async function refreshRun() {
+  try {
+    const r = await runApi("GET");
+    if (!r) return;
+    if (!r.ok) { setRunStatus(`<span class="bad">${escHtml(r.data.error || "Couldn't load status")}</span>`); return; }
+    setRunStatus(describeRun(r.data.run));
+    const active = r.data.run && r.data.run.status !== "completed";
+    if (active && !runPoll) runPoll = setInterval(refreshRun, 15000);
+    if (!active && runPoll) { clearInterval(runPoll); runPoll = null; }
+  } catch { setRunStatus('<span class="bad">Couldn\'t reach the server.</span>'); }
+}
+async function startRun() {
+  const btn = document.getElementById("run-go");
+  btn.disabled = true;
+  try {
+    const topics = document.getElementById("run-topics").value.trim();
+    const r = await runApi("POST", { topics });
+    if (!r) return;
+    if (r.ok) {
+      toast("Research run started");
+      setRunStatus("<b>Queued</b> · starting up…");
+      setTimeout(refreshRun, 5000);
+    } else {
+      setRunStatus(`<span class="bad">${escHtml(r.data.error || "Couldn't start the run")}</span>`);
+      if (r.data.run) setTimeout(refreshRun, 1000);
+    }
+  } catch { setRunStatus('<span class="bad">Couldn\'t reach the server.</span>'); }
+  finally { btn.disabled = false; }
 }
 
 // ── UTILS ─────────────────────────────────────────────────────────────────────
