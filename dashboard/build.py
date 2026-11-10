@@ -100,9 +100,24 @@ def categorize(filename: str) -> str:
     return "crypto"
 
 
-def extract_date(filename: str):
+def extract_date(filename: str, content: str = ""):
+    """Date a brief by its filename, else by the end of its "Date range" line,
+    else by a "Research date" note. Returns YYYY-MM-DD or None."""
     m = re.search(r"(\d{4}-\d{2}-\d{2})", filename)
+    if m:
+        return m.group(1)
+    head = content[:3000]
+    m = re.search(r"Date range:\s*\d{4}-\d{2}-\d{2}\s+to\s+(\d{4}-\d{2}-\d{2})", head)
+    if m:
+        return m.group(1)
+    m = re.search(r"Research date:\s*(\d{4}-\d{2}-\d{2})", head)
     return m.group(1) if m else None
+
+
+LIBRARY_BLOCK = re.compile(
+    r"<!-- last30days:library-context:start -->.*?<!-- last30days:library-context:end -->",
+    re.S,
+)
 
 
 def display_name(stem: str) -> str:
@@ -119,20 +134,27 @@ def main():
     if RESEARCH_DIR.exists():
         for path in sorted(RESEARCH_DIR.glob("*.md"), reverse=True):
             content = path.read_text(encoding="utf-8", errors="replace")
+            body = LIBRARY_BLOCK.sub("", content)
             preview_lines = [
-                l for l in content.splitlines()
+                l for l in body.splitlines()
                 if l.strip() and not l.startswith("#") and not l.startswith("---")
                 and not l.startswith(">") and not l.startswith("-  Date")
                 and not l.startswith("- Date") and not l.startswith("- Source")
+                and not l.startswith("- Some sources") and not l.startswith("<!--")
             ]
             files.append({
                 "filename": path.name,
                 "display_name": display_name(path.stem),
                 "category": categorize(path.name),
-                "date": extract_date(path.name),
+                "date": extract_date(path.name, content),
                 "preview": " ".join(preview_lines[:2])[:200],
                 "content": content,
             })
+
+    # Newest first; undated briefs go last. The dashboard and its chat both
+    # read this order, so fresh research shows on top and feeds the chat.
+    files.sort(key=lambda f: f["filename"])
+    files.sort(key=lambda f: f["date"] or "", reverse=True)
 
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
